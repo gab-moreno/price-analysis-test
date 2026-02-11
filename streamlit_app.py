@@ -10,7 +10,113 @@ import io
 import uuid
 from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
+# -------------------------------------------------
+# HELPER FUNCTIONS (EDITOR LOGIC)
+# -------------------------------------------------
 
+
+def init_editor_structure(df):
+    df = df.copy()
+
+    if "_id" not in df.columns:
+        df["_id"] = [str(uuid.uuid4())[:8] for _ in range(len(df))]
+
+    if "_parentId" not in df.columns:
+        df["_parentId"] = ""
+
+    if "_order" not in df.columns:
+        df["_order"] = list(range(len(df)))
+
+    if "_group" not in df.columns:
+        df["_group"] = (
+            df.get("code", "").astype(str) + "|" +
+            df.get("Power Type", "").astype(str)
+        )
+
+    return df
+
+
+def get_sorted_editor_df(df):
+    return df.sort_values(by=["_parentId", "_order"]).reset_index(drop=True)
+
+
+def reorder_row(df, row_id, direction):
+    df = df.copy()
+    idx = df.index[df["_id"] == row_id]
+
+    if len(idx) == 0:
+        return df
+
+    idx = idx[0]
+
+    if direction == "up" and idx > 0:
+        df.iloc[[idx, idx - 1]] = df.iloc[[idx - 1, idx]].values
+
+    elif direction == "down" and idx < len(df) - 1:
+        df.iloc[[idx, idx + 1]] = df.iloc[[idx + 1, idx]].values
+
+    df["_order"] = list(range(len(df)))
+    return df
+
+
+def convert_type(df, row_id):
+    df = df.copy()
+    idx = df.index[df["_id"] == row_id]
+
+    if len(idx) == 0:
+        return df
+
+    idx = idx[0]
+
+    current_type = df.at[idx, "type"]
+
+    if current_type == "item":
+        df.at[idx, "type"] = "subitem"
+    else:
+        df.at[idx, "type"] = "item"
+
+    return df
+
+
+def delete_row(df, row_id):
+    df = df.copy()
+    df = df[df["_id"] != row_id]
+    df = df.reset_index(drop=True)
+    df["_order"] = list(range(len(df)))
+    return df
+
+
+def spread_row(df, source_id, target_ids):
+    df = df.copy()
+
+    source_row = df[df["_id"] == source_id]
+    if source_row.empty:
+        return df
+
+    source_row = source_row.iloc[0]
+
+    for target_id in target_ids:
+        target_idx = df.index[df["_id"] == target_id]
+        if len(target_idx) == 0:
+            continue
+
+        target_idx = target_idx[0]
+
+        for col in df.columns:
+            if col not in ["_id", "_parentId", "_order"]:
+                df.at[target_idx, col] = source_row[col]
+
+    return df
+
+
+def editor_to_flat_df(df):
+    df = df.copy()
+    drop_cols = ["_id", "_parentId", "_order", "_group"]
+    return df.drop(columns=[c for c in drop_cols if c in df.columns])
+
+
+def sync_grid_edits(edited_df):
+    return edited_df.copy()
 
 st.set_page_config(layout="wide")
 
