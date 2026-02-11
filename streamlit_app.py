@@ -8,6 +8,7 @@ from openpyxl.utils import get_column_letter
 from datetime import datetime
 import io
 import uuid
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode, JsCode
 
 
 
@@ -24,6 +25,10 @@ if "editor_df" not in st.session_state:
     st.session_state.editor_df = None
 if "editor_initialized" not in st.session_state:
     st.session_state.editor_initialized = False
+if "spread_mode" not in st.session_state:
+    st.session_state.spread_mode = False
+if "pending_delete" not in st.session_state:
+    st.session_state.pending_delete = None
 # -------------------------------------------------
 # HEADER
 # -------------------------------------------------
@@ -121,198 +126,26 @@ if uploaded_file:
     st.session_state.df = df.copy()
     st.session_state.editor_df = None
     st.session_state.editor_initialized = False
+    st.session_state.spread_mode = False
+    st.session_state.pending_delete = None
     st.session_state.current_job_path = None
     st.session_state.job_loaded_from_queue = False
 
     st.success("📤 Manual file loaded (queue overridden)")
 
 # ==============================================================
-# STEP 3: ADD THESE HELPER FUNCTIONS (before the editor section)
+# STEP 4: REPLACE your "✏️ Review Source Table" section with this
 # ==============================================================
-
-def init_editor_structure(df):
-    """
-    Convert flat CSV DataFrame into parent-child structure.
-    Assigns id, parentId, order to each row.
-    Items (type='item') get parentId=None.
-    Subitems (type='subitem') get parentId = the preceding item's id.
-    """
-    edf = df.copy()
-    edf["id"] = [str(uuid.uuid4())[:8] for _ in range(len(edf))]
-    edf["parentId"] = None
-    edf["order"] = 0
-
-    current_parent_id = None
-    child_counter = {}
-
-    for idx in edf.index:
-        row_type = str(edf.at[idx, "type"]).strip().lower()
-
-        if row_type == "item":
-            current_parent_id = edf.at[idx, "id"]
-            edf.at[idx, "parentId"] = None
-            edf.at[idx, "order"] = 0
-            child_counter[current_parent_id] = 0
-        elif row_type == "subitem":
-            if current_parent_id is not None:
-                edf.at[idx, "parentId"] = current_parent_id
-                edf.at[idx, "order"] = child_counter.get(current_parent_id, 0)
-                child_counter[current_parent_id] = child_counter.get(current_parent_id, 0) + 1
-            else:
-                # Orphan subitem — treat as item
-                edf.at[idx, "type"] = "item"
-                edf.at[idx, "parentId"] = None
-                edf.at[idx, "order"] = 0
-
-    return edf
-
-
-def get_product_groups(edf):
-    """Group items by code + Power Type."""
-    items = edf[edf["type"] == "item"]
-    groups = items.groupby(["code", "Power Type"], dropna=False)
-    return groups
-
-
-def reorder_row(edf, row_id, direction):
-    """Move a row up or down among its siblings."""
-    row = edf[edf["id"] == row_id].iloc[0]
-    parent = row["parentId"]
-    current_order = row["order"]
-
-    if row["type"] == "item":
-        # Siblings = items with same code + Power Type
-        siblings = edf[
-            (edf["type"] == "item") &
-            (edf["code"] == row["code"]) &
-            (edf["Power Type"] == row["Power Type"])
-        ].sort_values("order")
-    else:
-        # Siblings = subitems with same parentId
-        siblings = edf[
-            (edf["parentId"] == parent) &
-            (edf["type"] == "subitem")
-        ].sort_values("order")
-
-    orders = siblings["order"].tolist()
-    ids = siblings["id"].tolist()
-    pos = ids.index(row_id)
-
-    if direction == "up" and pos > 0:
-        swap_id = ids[pos - 1]
-        swap_order = edf.loc[edf["id"] == swap_id, "order"].iloc[0]
-        edf.loc[edf["id"] == row_id, "order"] = swap_order
-        edf.loc[edf["id"] == swap_id, "order"] = current_order
-    elif direction == "down" and pos < len(ids) - 1:
-        swap_id = ids[pos + 1]
-        swap_order = edf.loc[edf["id"] == swap_id, "order"].iloc[0]
-        edf.loc[edf["id"] == row_id, "order"] = swap_order
-        edf.loc[edf["id"] == swap_id, "order"] = current_order
-
-    return edf
-
-
-def convert_type(edf, row_id):
-    """Toggle item <-> subitem with orphan handling."""
-    row = edf[edf["id"] == row_id].iloc[0]
-
-    if row["type"] == "subitem":
-        # Subitem → Item: clear parent, set order 0
-        edf.loc[edf["id"] == row_id, "type"] = "item"
-        edf.loc[edf["id"] == row_id, "parentId"] = None
-        edf.loc[edf["id"] == row_id, "order"] = 0
-    else:
-        # Item → Subitem: promote orphaned children to items first
-        children = edf[edf["parentId"] == row_id]
-        for cidx in children.index:
-            edf.at[cidx, "type"] = "item"
-            edf.at[cidx, "parentId"] = None
-            edf.at[cidx, "order"] = 0
-
-        # Now this row needs a new parent — find first item in same product group
-        same_product = edf[
-            (edf["type"] == "item") &
-            (edf["code"] == row["code"]) &
-            (edf["Power Type"] == row["Power Type"]) &
-            (edf["id"] != row_id)
-        ]
-        if not same_product.empty:
-            new_parent = same_product.iloc[0]["id"]
-            existing_children = edf[edf["parentId"] == new_parent]
-            next_order = existing_children["order"].max() + 1 if not existing_children.empty else 0
-            edf.loc[edf["id"] == row_id, "type"] = "subitem"
-            edf.loc[edf["id"] == row_id, "parentId"] = new_parent
-            edf.loc[edf["id"] == row_id, "order"] = next_order
-
-    return edf
-
-
-def spread_row(edf, row_id, target_item_ids):
-    """Copy a row as subitem under each target item."""
-    source = edf[edf["id"] == row_id].iloc[0]
-
-    new_rows = []
-    for target_id in target_item_ids:
-        target_item = edf[edf["id"] == target_id].iloc[0]
-        existing = edf[edf["parentId"] == target_id]
-        next_order = int(existing["order"].max() + 1) if not existing.empty else 0
-
-        new_row = source.copy()
-        new_row["id"] = str(uuid.uuid4())[:8]
-        new_row["parentId"] = target_id
-        new_row["type"] = "subitem"
-        new_row["order"] = next_order
-        new_row["supplier"] = target_item["supplier"]
-        new_rows.append(new_row)
-
-    if new_rows:
-        edf = pd.concat([edf, pd.DataFrame(new_rows)], ignore_index=True)
-    return edf
-
-
-def delete_row(edf, row_id):
-    """Delete row. If item, cascade-delete children."""
-    row = edf[edf["id"] == row_id].iloc[0]
-    if row["type"] == "item":
-        edf = edf[edf["parentId"] != row_id]  # delete children
-    edf = edf[edf["id"] != row_id]  # delete self
-    return edf
-
-
-def editor_to_flat_df(edf):
-    """
-    Convert editor DataFrame back to flat format compatible
-    with your existing HTML preview and Excel generator.
-    Strips editor-only columns (id, parentId, order).
-    Preserves the parent-child ordering.
-    """
-    # Sort: items first (by code, Power Type, order), then their children
-    result_rows = []
-    items = edf[edf["type"] == "item"].sort_values(["code", "Power Type", "order"])
-
-    for _, item in items.iterrows():
-        result_rows.append(item)
-        children = edf[edf["parentId"] == item["id"]].sort_values("order")
-        for _, child in children.iterrows():
-            result_rows.append(child)
-
-    # Also include any orphaned subitems (shouldn't exist, but safety)
-    all_ids = set(r["id"] for r in result_rows)
-    for _, row in edf.iterrows():
-        if row["id"] not in all_ids:
-            result_rows.append(row)
-
-    flat = pd.DataFrame(result_rows)
-    # Drop editor columns — your preview/Excel don't need them
-    flat = flat.drop(columns=["id", "parentId", "order"], errors="ignore")
-    flat = flat.reset_index(drop=True)
-    return flat
-    
-# editor dynamic
+# Delete this block:
+#   if st.session_state.df is not None:
+#       st.subheader("✏️ Review Source Table")
+#       st.session_state.df = st.data_editor(...)
+#
+# Paste the following:
 
 if st.session_state.df is not None:
 
-    # --- Initialize editor structure from flat df ---
+    # --- Initialize editor structure ---
     if not st.session_state.editor_initialized or st.session_state.editor_df is None:
         st.session_state.editor_df = init_editor_structure(st.session_state.df)
         st.session_state.editor_initialized = True
@@ -321,170 +154,414 @@ if st.session_state.df is not None:
 
     st.subheader("✏️ Quote Editor")
 
-    # === RAW TABLE EDITOR (for direct cell edits: price, description, etc.) ===
-    with st.expander("📝 Edit Raw Data (click cells to edit)", expanded=False):
-        # Show editable columns only (hide id/parentId/order from user)
-        display_cols = [c for c in edf.columns if c not in ["id", "parentId", "order"]]
-        edited = st.data_editor(
-            edf[display_cols],
-            use_container_width=True,
-            num_rows="dynamic",
-            key="raw_editor"
-        )
-        # Sync edits back (preserve id/parentId/order)
-        for col in display_cols:
-            edf[col] = edited[col].values[:len(edf)]
-        st.session_state.editor_df = edf
+    # ──────────────────────────────────────────
+    # CUSTOM CSS FOR AG GRID CONTAINER
+    # ──────────────────────────────────────────
+    st.markdown("""
+    <style>
+        /* AG Grid dark theme overrides */
+        .ag-theme-streamlit {
+            --ag-background-color: #0e1117;
+            --ag-header-background-color: #1a1c24;
+            --ag-odd-row-background-color: #0e1117;
+            --ag-row-hover-color: rgba(77,171,247,0.06);
+            --ag-border-color: #2d3140;
+            --ag-header-foreground-color: #8b8fa3;
+            --ag-foreground-color: #e8eaed;
+            --ag-font-family: 'Segoe UI', sans-serif;
+            --ag-font-size: 13px;
+            --ag-row-height: 38px;
+            --ag-header-height: 36px;
+        }
 
-    # === STRUCTURED EDITOR (grouped view with actions) ===
-    st.markdown("---")
-    st.markdown("#### 📦 Product Groups")
+        /* Subitem indent */
+        .subitem-row { padding-left: 28px !important; }
 
-    items_only = edf[edf["type"] == "item"]
-    product_keys = items_only[["code", "Power Type"]].drop_duplicates().values.tolist()
+        /* Item row bold */
+        .item-row { font-weight: 600; }
 
-    for code, power_type in product_keys:
-        group_items = edf[
-            (edf["type"] == "item") &
-            (edf["code"] == code) &
-            (edf["Power Type"] == power_type)
-        ].sort_values("order")
+        /* Winner column */
+        .winner-cell {
+            background-color: rgba(81,207,102,0.08) !important;
+            border-left: 2px solid #51cf66 !important;
+        }
 
-        with st.expander(f"🔹 {code} — {power_type} ({len(group_items)} suppliers)", expanded=False):
-            for _, item in group_items.iterrows():
-                item_id = item["id"]
-                children = edf[edf["parentId"] == item_id].sort_values("order")
-                subtotal = item["price"] if pd.notna(item["price"]) else 0
-                for _, ch in children.iterrows():
-                    subtotal += ch["price"] if pd.notna(ch["price"]) else 0
+        /* Type badges */
+        .type-badge-item {
+            background: rgba(77,171,247,0.12);
+            color: #4dabf7;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
+        .type-badge-sub {
+            background: rgba(139,143,163,0.12);
+            color: #8b8fa3;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-size: 10px;
+            font-weight: 600;
+            text-transform: uppercase;
+        }
 
-                # --- ITEM HEADER ---
-                st.markdown(
-                    f"**🏢 {item['supplier']}** — {item['description']} "
-                    f"— `${float(item['price']):,.2f}` "
-                    f"| Subtotal: `${float(subtotal):,.2f}`"
+        /* Action buttons in grid */
+        .grid-action-btn {
+            background: transparent;
+            border: 1px solid #2d3140;
+            color: #8b8fa3;
+            border-radius: 4px;
+            width: 24px;
+            height: 24px;
+            cursor: pointer;
+            font-size: 12px;
+            margin: 0 1px;
+        }
+        .grid-action-btn:hover {
+            background: #22252e;
+            color: #e8eaed;
+        }
+
+        /* Compact buttons row */
+        div[data-testid="stHorizontalBlock"] > div {
+            padding: 0 2px;
+        }
+    </style>
+    """, unsafe_allow_html=True)
+
+    # ──────────────────────────────────────────
+    # GROUP BY PRODUCT → RENDER AG GRID PER GROUP
+    # ──────────────────────────────────────────
+    product_groups = edf[edf["type"] == "item"][["_group"]].drop_duplicates()["_group"].tolist()
+
+    for group_key in product_groups:
+        code, power_type = group_key.split("|", 1)
+
+        # Get all rows in this group (items + their subitems)
+        group_item_ids = edf[
+            (edf["type"] == "item") & (edf["_group"] == group_key)
+        ]["_id"].tolist()
+
+        group_rows = edf[
+            (edf["_group"] == group_key) |
+            (edf["_parentId"].isin(group_item_ids))
+        ]
+
+        # Sort properly: item then its children
+        sorted_rows = get_sorted_editor_df(group_rows)
+
+        supplier_count = len(sorted_rows[sorted_rows["type"] == "item"])
+
+        # ── GROUP HEADER ──
+        with st.expander(
+            f"📦 **{code}** — {power_type} ({supplier_count} suppliers)",
+            expanded=True
+        ):
+            # ── AG GRID CONFIGURATION ──
+            gb = GridOptionsBuilder.from_dataframe(
+                sorted_rows[["_id", "type", "supplier", "description", "price", "brand", "code", "Power Type", "_parentId", "_order"]]
+            )
+
+            # Column definitions
+            gb.configure_column("_id", header_name="", hide=True)
+            gb.configure_column("_parentId", hide=True)
+            gb.configure_column("_order", hide=True)
+            gb.configure_column("code", hide=True)
+            gb.configure_column("Power Type", hide=True)
+            gb.configure_column("brand", hide=True)
+
+            # Type column with custom renderer
+            type_renderer = JsCode("""
+                function(params) {
+                    if (params.value === 'item') {
+                        return '<span style="background:rgba(77,171,247,0.12);color:#4dabf7;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:600;text-transform:uppercase;">ITEM</span>';
+                    } else {
+                        return '<span style="background:rgba(139,143,163,0.12);color:#8b8fa3;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:600;text-transform:uppercase;">SUB</span>';
+                    }
+                }
+            """)
+            gb.configure_column(
+                "type",
+                header_name="Type",
+                width=70,
+                cellRenderer=type_renderer,
+                editable=False
+            )
+
+            # Supplier column
+            gb.configure_column(
+                "supplier",
+                header_name="Supplier",
+                width=140,
+                editable=True
+            )
+
+            # Description with indent for subitems
+            desc_renderer = JsCode("""
+                function(params) {
+                    var prefix = '';
+                    if (params.data.type === 'subitem') {
+                        prefix = '<span style="color:#5c6072;margin-right:4px;">↳</span>';
+                    }
+                    return prefix + params.value;
+                }
+            """)
+            gb.configure_column(
+                "description",
+                header_name="Description",
+                flex=2,
+                editable=True,
+                cellRenderer=desc_renderer
+            )
+
+            # Price column — editable with formatting
+            price_formatter = JsCode("""
+                function(params) {
+                    if (params.value == null || params.value === '' || isNaN(params.value)) return '—';
+                    return '$' + Number(params.value).toLocaleString('en-US', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+                }
+            """)
+            gb.configure_column(
+                "price",
+                header_name="Price",
+                width=130,
+                editable=True,
+                type=["numericColumn"],
+                valueFormatter=price_formatter
+            )
+
+            # Row styling: bold items, lighter subitems
+            row_style = JsCode("""
+                function(params) {
+                    if (params.data.type === 'item') {
+                        return {'font-weight': '600', 'background-color': 'rgba(77,171,247,0.03)'};
+                    } else {
+                        return {'color': '#8b8fa3', 'padding-left': '12px'};
+                    }
+                }
+            """)
+
+            # Selection for actions
+            gb.configure_selection(
+                selection_mode="single",
+                use_checkbox=False
+            )
+
+            # Row dragging for reorder
+            gb.configure_column(
+                "type",
+                rowDrag=True,
+                rowDragText=JsCode("""
+                    function(params) {
+                        return params.rowNode.data.description;
+                    }
+                """)
+            )
+
+            # Grid options
+            gb.configure_grid_options(
+                rowDragManaged=True,
+                animateRows=True,
+                getRowStyle=row_style,
+                suppressMoveWhenRowDragging=False,
+                domLayout='autoHeight',
+                rowHeight=38,
+                headerHeight=36,
+            )
+
+            grid_options = gb.build()
+
+            # ── RENDER AG GRID ──
+            grid_response = AgGrid(
+                sorted_rows[["_id", "type", "supplier", "description", "price", "brand", "code", "Power Type", "_parentId", "_order"]],
+                gridOptions=grid_options,
+                update_mode=GridUpdateMode.VALUE_CHANGED | GridUpdateMode.SELECTION_CHANGED,
+                allow_unsafe_jscode=True,
+                theme="streamlit",
+                height=min(400, 36 + 38 * len(sorted_rows) + 10),
+                key=f"grid_{group_key}",
+                fit_columns_on_grid_load=True,
+            )
+
+            # ── SYNC EDITS BACK ──
+            if grid_response and grid_response.data is not None:
+                updated_data = grid_response.data
+                for _, row in updated_data.iterrows():
+                    rid = row.get("_id")
+                    if rid and rid in edf["_id"].values:
+                        for col in ["price", "description", "supplier"]:
+                            if col in row.index:
+                                edf.loc[edf["_id"] == rid, col] = row[col]
+                st.session_state.editor_df = edf
+
+            # ── SELECTED ROW ──
+            selected = grid_response.selected_rows
+            if selected is not None and len(selected) > 0:
+                sel_row = selected.iloc[0] if hasattr(selected, 'iloc') else selected[0]
+                sel_id = sel_row.get("_id", sel_row.get("_id", ""))
+                sel_desc = sel_row.get("description", "")
+                sel_type = sel_row.get("type", "")
+            else:
+                sel_id = None
+                sel_desc = ""
+                sel_type = ""
+
+            # ── ACTION BUTTONS (compact row) ──
+            st.markdown(f"<small style='color:#8b8fa3;'>Selected: <b>{sel_desc or 'Click a row'}</b></small>", unsafe_allow_html=True)
+
+            col1, col2, col3, col4, col5 = st.columns(5)
+
+            with col1:
+                if st.button("⬆ Up", key=f"up_{group_key}", disabled=sel_id is None, use_container_width=True):
+                    st.session_state.editor_df = reorder_row(edf, sel_id, "up")
+                    st.rerun()
+
+            with col2:
+                if st.button("⬇ Down", key=f"dn_{group_key}", disabled=sel_id is None, use_container_width=True):
+                    st.session_state.editor_df = reorder_row(edf, sel_id, "down")
+                    st.rerun()
+
+            with col3:
+                convert_label = "→ Sub" if sel_type == "item" else "→ Item"
+                if st.button(f"🔄 {convert_label}", key=f"cv_{group_key}", disabled=sel_id is None, use_container_width=True):
+                    st.session_state.editor_df = convert_type(edf, sel_id)
+                    st.rerun()
+
+            with col4:
+                if st.button("📋 Spread", key=f"sp_{group_key}", disabled=sel_id is None, use_container_width=True):
+                    st.session_state.spread_mode = sel_id
+                    st.session_state._spread_group = group_key
+
+            with col5:
+                if st.button("🗑 Delete", key=f"dl_{group_key}", disabled=sel_id is None, use_container_width=True):
+                    st.session_state.pending_delete = sel_id
+
+            # ── DELETE CONFIRMATION ──
+            if st.session_state.pending_delete and st.session_state.pending_delete == sel_id:
+                del_row = edf[edf["_id"] == sel_id]
+                if not del_row.empty:
+                    del_row = del_row.iloc[0]
+                    child_count = len(edf[edf["_parentId"] == sel_id])
+                    warn_msg = f"Delete **{del_row['description']}**?"
+                    if child_count > 0:
+                        warn_msg += f" ⚠️ This will also delete **{child_count} subitems**."
+
+                    st.warning(warn_msg)
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        if st.button("✅ Confirm Delete", key=f"cdel_{group_key}", type="primary", use_container_width=True):
+                            st.session_state.editor_df = delete_row(edf, sel_id)
+                            st.session_state.pending_delete = None
+                            st.rerun()
+                    with c2:
+                        if st.button("Cancel", key=f"xdel_{group_key}", use_container_width=True):
+                            st.session_state.pending_delete = None
+                            st.rerun()
+
+            # ── SPREAD PANEL ──
+            if st.session_state.spread_mode and st.session_state.get("_spread_group") == group_key:
+                st.info(f"📋 Spreading row to multiple items")
+                all_items = edf[edf["type"] == "item"][["_id", "supplier", "code", "description"]].copy()
+                all_items["label"] = all_items.apply(
+                    lambda r: f"{r['supplier']} — {r['code']} — {r['description']}", axis=1
+                )
+                target_options = dict(zip(all_items["label"], all_items["_id"]))
+
+                targets = st.multiselect(
+                    "Copy as subitem to:",
+                    options=list(target_options.keys()),
+                    key=f"sptgt_{group_key}"
                 )
 
-                # --- ITEM ACTION BUTTONS ---
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    if st.button("⬆️", key=f"up_{item_id}", help="Move up"):
-                        st.session_state.editor_df = reorder_row(edf, item_id, "up")
-                        st.rerun()
-                with col2:
-                    if st.button("⬇️", key=f"down_{item_id}", help="Move down"):
-                        st.session_state.editor_df = reorder_row(edf, item_id, "down")
-                        st.rerun()
-                with col3:
-                    if st.button("🔄 → Sub", key=f"conv_{item_id}", help="Convert to subitem"):
-                        st.session_state.editor_df = convert_type(edf, item_id)
-                        st.rerun()
-                with col4:
-                    if st.button("🗑️", key=f"del_{item_id}", help="Delete item + children"):
-                        child_count = len(children)
-                        st.session_state.editor_df = delete_row(edf, item_id)
+                sc1, sc2 = st.columns(2)
+                with sc1:
+                    if st.button("✅ Spread Now", key=f"dosp_{group_key}", type="primary", use_container_width=True):
+                        if targets:
+                            target_ids = [target_options[t] for t in targets]
+                            st.session_state.editor_df = spread_row(edf, st.session_state.spread_mode, target_ids)
+                            st.session_state.spread_mode = False
+                            st.success(f"Spread to {len(target_ids)} items!")
+                            st.rerun()
+                with sc2:
+                    if st.button("Cancel", key=f"xsp_{group_key}", use_container_width=True):
+                        st.session_state.spread_mode = False
                         st.rerun()
 
-                # --- SUBITEMS ---
-                if not children.empty:
-                    for _, child in children.iterrows():
-                        child_id = child["id"]
-                        st.markdown(
-                            f"&nbsp;&nbsp;&nbsp;&nbsp;↳ {child['description']} "
-                            f"— `${float(child['price']):,.2f}`"
-                        )
-                        c1, c2, c3, c4 = st.columns(4)
-                        with c1:
-                            if st.button("⬆️", key=f"up_{child_id}"):
-                                st.session_state.editor_df = reorder_row(edf, child_id, "up")
-                                st.rerun()
-                        with c2:
-                            if st.button("⬇️", key=f"down_{child_id}"):
-                                st.session_state.editor_df = reorder_row(edf, child_id, "down")
-                                st.rerun()
-                        with c3:
-                            if st.button("🔄 → Item", key=f"conv_{child_id}"):
-                                st.session_state.editor_df = convert_type(edf, child_id)
-                                st.rerun()
-                        with c4:
-                            if st.button("🗑️", key=f"del_{child_id}"):
-                                st.session_state.editor_df = delete_row(edf, child_id)
-                                st.rerun()
+            # ── SUBTOTALS DISPLAY ──
+            items_in_group = sorted_rows[sorted_rows["type"] == "item"]
+            subtotals = []
+            for _, itm in items_in_group.iterrows():
+                item_price = float(itm["price"]) if pd.notna(itm["price"]) else 0
+                children = sorted_rows[sorted_rows["_parentId"] == itm["_id"]]
+                child_sum = children["price"].sum() if not children.empty else 0
+                total = item_price + child_sum
+                subtotals.append({"supplier": itm["supplier"], "total": total})
 
-                st.markdown("---")
+            if subtotals:
+                st.markdown("**Supplier Totals (before tax):**")
+                cols = st.columns(len(subtotals))
+                min_total = min(s["total"] for s in subtotals)
+                for i, s in enumerate(subtotals):
+                    with cols[i]:
+                        is_winner = s["total"] == min_total
+                        label = f"🏆 {s['supplier']}" if is_winner else s["supplier"]
+                        st.metric(label=label, value=f"${s['total']:,.2f}")
 
-    # === SPREAD (COPY) TOOL ===
-    st.markdown("#### 📋 Spread Row to Multiple Items")
-
-    all_rows = edf[["id", "type", "supplier", "description"]].copy()
-    all_rows["label"] = all_rows.apply(
-        lambda r: f"[{r['type']}] {r['supplier']} — {r['description']}", axis=1
-    )
-    row_options = dict(zip(all_rows["label"], all_rows["id"]))
-
-    source_label = st.selectbox(
-        "Select row to copy",
-        options=list(row_options.keys()),
-        key="spread_source"
-    )
-
-    # Target items (only items)
-    item_rows = edf[edf["type"] == "item"][["id", "supplier", "code", "description"]].copy()
-    item_rows["label"] = item_rows.apply(
-        lambda r: f"{r['supplier']} — {r['code']} — {r['description']}", axis=1
-    )
-    target_options = dict(zip(item_rows["label"], item_rows["id"]))
-
-    target_labels = st.multiselect(
-        "Spread as subitem to these items",
-        options=list(target_options.keys()),
-        key="spread_targets"
-    )
-
-    if st.button("📋 Spread Now", key="spread_btn"):
-        if source_label and target_labels:
-            source_id = row_options[source_label]
-            target_ids = [target_options[t] for t in target_labels]
-            st.session_state.editor_df = spread_row(edf, source_id, target_ids)
-            st.success(f"Spread to {len(target_ids)} items!")
-            st.rerun()
-        else:
-            st.warning("Select a source row and at least one target.")
-
-    # === ADD NEW ROW ===
+    # ──────────────────────────────────────────
+    # ADD NEW ROW (global, below all groups)
+    # ──────────────────────────────────────────
+    st.markdown("---")
     st.markdown("#### ➕ Add New Row")
+
     with st.expander("Add a new item or subitem", expanded=False):
-        new_type = st.radio("Type", ["item", "subitem"], horizontal=True, key="new_type")
-        new_supplier = st.text_input("Supplier", key="new_supplier")
-        new_brand = st.text_input("Brand", key="new_brand")
-        new_code = st.text_input("Code", key="new_code")
-        new_desc = st.text_input("Description", key="new_desc")
-        new_power = st.text_input("Power Type", key="new_power")
-        new_price = st.number_input("Price", min_value=0.0, value=0.0, key="new_price")
+        nc1, nc2 = st.columns(2)
+        with nc1:
+            new_type = st.radio("Type", ["item", "subitem"], horizontal=True, key="new_type")
+        with nc2:
+            new_supplier = st.text_input("Supplier", key="new_supplier")
 
-        parent_id = None
+        nc3, nc4, nc5 = st.columns(3)
+        with nc3:
+            new_brand = st.text_input("Brand", key="new_brand")
+        with nc4:
+            new_code = st.text_input("Code", key="new_code")
+        with nc5:
+            new_power = st.text_input("Power Type", key="new_power")
+
+        nc6, nc7 = st.columns([3, 1])
+        with nc6:
+            new_desc = st.text_input("Description", key="new_desc")
+        with nc7:
+            new_price = st.number_input("Price", min_value=0.0, value=0.0, key="new_price")
+
+        parent_id = ""
         if new_type == "subitem":
-            parent_label = st.selectbox(
-                "Parent Item",
-                options=list(target_options.keys()),
-                key="new_parent"
+            all_items = edf[edf["type"] == "item"][["_id", "supplier", "code", "description"]].copy()
+            all_items["label"] = all_items.apply(
+                lambda r: f"{r['supplier']} — {r['code']} — {r['description']}", axis=1
             )
+            parent_options = dict(zip(all_items["label"], all_items["_id"]))
+            parent_label = st.selectbox("Parent Item", options=list(parent_options.keys()), key="new_parent")
             if parent_label:
-                parent_id = target_options[parent_label]
+                parent_id = parent_options[parent_label]
 
-        if st.button("➕ Add Row", key="add_row_btn"):
+        if st.button("➕ Add Row", key="add_row_btn", type="primary"):
             new_id = str(uuid.uuid4())[:8]
+            group_key = f"{new_code}|{new_power}"
+
             if new_type == "subitem" and parent_id:
-                existing = edf[edf["parentId"] == parent_id]
-                new_order = int(existing["order"].max() + 1) if not existing.empty else 0
+                existing = edf[edf["_parentId"] == parent_id]
+                new_order = int(existing["_order"].max() + 1) if not existing.empty else 0
             else:
                 new_order = 0
-                parent_id = None
+                parent_id = ""
 
             new_row = {
-                "id": new_id,
-                "parentId": parent_id,
-                "order": new_order,
+                "_id": new_id,
+                "_parentId": parent_id,
+                "_order": new_order,
+                "_group": group_key,
                 "type": new_type,
                 "supplier": new_supplier,
                 "brand": new_brand,
@@ -496,12 +573,13 @@ if st.session_state.df is not None:
             st.session_state.editor_df = pd.concat(
                 [edf, pd.DataFrame([new_row])], ignore_index=True
             )
-            st.success(f"Added new {new_type}: {new_desc}")
+            st.success(f"✅ Added: {new_desc}")
             st.rerun()
 
-    # === SYNC BACK TO FLAT DF (feeds your preview + Excel) ===
+    # ──────────────────────────────────────────
+    # SYNC BACK TO FLAT DF (feeds preview + Excel)
+    # ──────────────────────────────────────────
     st.session_state.df = editor_to_flat_df(st.session_state.editor_df)
-
 
 # -------------------------------------------------
 # TAX INPUT
